@@ -1,6 +1,7 @@
 import bcrypt from "bcrypt";
 import { User } from "../../models/user.model";
 import { Account } from "../../models/account.model";
+import { addEmailJob } from "../../queue/emailQueue";
 
 interface registerUserDTO {
     email: string;
@@ -32,6 +33,11 @@ const registerUser = async (data: registerUserDTO) => {
             passwordHash,
         });
         await account.save();
+        await addEmailJob({
+            to: email,
+            subject: "Welcome to our platform",
+            html: `<h1>Welcome ${user.name}</h1><p>Thanks for registering. Please verify your email.</p>`
+        });
 
         return user;
     } catch (error) {
