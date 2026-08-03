@@ -2,7 +2,9 @@ import bcrypt from "bcrypt";
 import { User } from "../../models/user.model";
 import { Account } from "../../models/account.model";
 import { addEmailJob } from "../../queue/emailQueue";
-
+import { generateOTP } from "../../utils/otp";
+import redisClient from "../../config/redis";
+import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from "../../utils/jwt";
 interface registerUserDTO {
     email: string;
     name: string;
@@ -33,16 +35,160 @@ const registerUser = async (data: registerUserDTO) => {
             passwordHash,
         });
         await account.save();
+        const otp = generateOTP();
+        await redisClient.set(`otp:${email}`,otp ,{EX: 600});
         await addEmailJob({
             to: email,
             subject: "Welcome to our platform",
-            html: `<h1>Welcome ${user.name}</h1><p>Thanks for registering. Please verify your email.</p>`
+            html: `<h1>Welcome ${user.name}</h1><p>Thanks for registering. Please verify your email.</p><div>${otp}</div>`
         });
-
         return user;
     } catch (error) {
         throw error;
     }
 }
 
-export { registerUser };
+//verify email by otp
+
+const verifyEmail = async (data:{email: string, otp: string}) => {
+    try {
+        const {email, otp} = data;
+        const storedOtp = await redisClient.get(`otp:${email}`);
+        if(!storedOtp || storedOtp !== otp){
+            throw new Error("Invalid or expired OTP");
+        }
+        await redisClient.del(`otp:${email}`);
+        await User.findOneAndUpdate({email}, {isEmailVerified: true});
+        return {message: "Email verified successfully"};
+    } catch (error) {
+        throw error
+    }
+
+}
+
+// login user
+
+const loginUser = async (data:{email: string, password: string}) => {
+    const {email, password} = data;
+    try {
+        const result = await User.aggregate([
+            { $match: { email } },
+            {
+                $lookup: {
+                    from: "accounts",
+                    localField: "_id",
+                    foreignField: "userId",
+                    as: "accountDetails"
+                }
+            },
+            { $unwind: "$accountDetails" }
+        ]);
+
+        if (!result || result.length === 0) {
+            throw new Error("Invalid Credentials");
+        }
+
+        const user = result[0];
+        const passwordHash = user.accountDetails.passwordHash;
+
+        if (!passwordHash) {
+            throw new Error("Invalid Credentials");
+        }
+
+        const isMatch = await bcrypt.compare(password, passwordHash);
+        if (!isMatch) {
+            throw new Error("Invalid Credentials");
+        }
+
+        const accessToken = await generateAccessToken({ userId: user._id.toString() });
+        const refreshToken = await generateRefreshToken({ userId: user._id.toString() });
+
+        const refreshHash = await bcrypt.hash(refreshToken, 10);
+        const sessionId = crypto.randomUUID()
+
+        await redisClient.set(`session:${sessionId}`, JSON.stringify({
+            userId: user._id,
+            refreshHash
+        }), {
+            EX: 7 * 24 * 60 * 60
+        });
+
+        return { 
+            user: { id: user._id, email: user.email, name: user.name, isEmailVerified: user.isEmailVerified }, 
+            accessToken, 
+            refreshToken,
+            sessionId 
+        };
+        
+    } catch (error) {
+        throw error;
+    }
+}
+
+// refresh AccessToken
+const refreshAccessToken = async (token: string) => {
+    try {
+        const [sessionId, refreshToken] = token.split("|");
+        const payload = await verifyRefreshToken(refreshToken);
+        
+        const storedToken = await redisClient.get(`session:${sessionId}`);
+        if (!storedToken) {
+            throw new Error("Invalid or expired refresh token session");
+        }
+        const session = JSON.parse(storedToken);
+        const isMatch = await bcrypt.compare(refreshToken, session.refreshHash);
+        if (!isMatch) {
+            throw new Error("Invalid or expired refresh token");
+        }
+
+        const user = await User.findById(payload.userId);
+        if (!user) {
+            throw new Error("User not found");
+        }
+        
+        const newAccessToken = await generateAccessToken({ userId: user._id.toString() });
+        const newRefreshToken = await generateRefreshToken({ userId: user._id.toString() });
+
+        const refreshHash = await bcrypt.hash(newRefreshToken,10);
+        const newSessionId = crypto.randomUUID();
+
+        await redisClient.del(`session:${sessionId}`);
+        await redisClient.set(`session:${newSessionId}`, JSON.stringify({
+            userId: user._id,
+            refreshHash
+        }), {
+            EX: 7 * 24 * 60 * 60
+        });
+
+        return { accessToken: newAccessToken, newRefreshToken, sessionId: newSessionId };
+        
+    } catch (error: any) {
+        throw new Error(error.message || "Invalid or expired refresh token");
+    }
+}
+//logout
+const logoutUser = async (sessionId:string)=>{
+    try {
+        await redisClient.del(`session:${sessionId}`);
+        return { message: "Logout successful" };
+    } catch (error:any) {
+        throw new Error(error.message || "Logout failed");
+    }
+}
+
+// get user profile
+const getUserProfile = async (userId: string) => {
+    try {
+        const user = await User.findById(userId).select("-__v");
+        if (!user) {
+            throw new Error("User not found");
+        }
+        return user;
+    } catch (error) {
+        throw error;
+    }
+}
+
+//logout user
+
+export { registerUser, verifyEmail, loginUser, refreshAccessToken, getUserProfile, logoutUser };
