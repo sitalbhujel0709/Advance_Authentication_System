@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { loginUser, registerUser, verifyEmail, refreshAccessToken, getUserProfile, logoutUser } from "./auth.service";
+import { loginUser, registerUser, verifyEmail, refreshAccessToken, getUserProfile, logoutUser, logoutAllDevices, forgotPassword, resetPassword } from "./auth.service";
 
 export const registerController = async (req: Request, res: Response): Promise<void> => {
     try {
@@ -130,5 +130,48 @@ export const getUserProfileController = async (req: Request, res: Response) => {
         res.status(200).json({ user });
     } catch (error: any) {
         res.status(404).json({ message: error.message });
+    }
+}
+
+export const logoutAllDevicesController = async (req: Request, res: Response) => {
+    try {
+        const userId = (req as any).user.userId;
+        await logoutAllDevices(userId);
+        res.clearCookie("accessToken");
+        res.clearCookie("refreshToken");
+        res.status(200).json({ message: "Logged out from all devices successfully" });
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+}}
+
+export const forgotPasswordController = async (req: Request, res: Response) => {
+    try {
+        const { email } = req.body;
+        if (!email) {
+            res.status(400).json({ message: "Email is required" });
+            return;
+        }
+        const response = await forgotPassword(email);
+        res.status(200).json(response);
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
+}
+
+export const resetPasswordController = async (req: Request, res: Response) => {
+    try {
+        const { email, otp, newPassword } = req.body;
+        if (!email || !otp || !newPassword) {
+            res.status(400).json({ message: "Email, OTP, and new password are required" });
+            return;
+        }
+        const response = await resetPassword({ email, otp, newPassword });
+        res.status(200).json(response);
+    } catch (error: any) {
+        if (error.message === "Invalid or expired OTP") {
+            res.status(400).json({ message: error.message });
+            return;
+        }
+        res.status(500).json({ message: error.message });
     }
 }

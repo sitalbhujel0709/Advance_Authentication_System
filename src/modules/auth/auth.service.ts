@@ -113,6 +113,8 @@ const loginUser = async (data:{email: string, password: string}) => {
             EX: 7 * 24 * 60 * 60
         });
 
+        await redisClient.sAdd(`user_sessions:${user._id.toString()}`, sessionId);
+
         return { 
             user: { id: user._id, email: user.email, name: user.name, isEmailVerified: user.isEmailVerified }, 
             accessToken, 
@@ -160,6 +162,9 @@ const refreshAccessToken = async (token: string) => {
             EX: 7 * 24 * 60 * 60
         });
 
+        await redisClient.sRem(`user_sessions:${user._id.toString()}`, sessionId);
+        await redisClient.sAdd(`user_sessions:${user._id.toString()}`, newSessionId);
+
         return { accessToken: newAccessToken, newRefreshToken, sessionId: newSessionId };
         
     } catch (error: any) {
@@ -169,10 +174,33 @@ const refreshAccessToken = async (token: string) => {
 //logout
 const logoutUser = async (sessionId:string)=>{
     try {
-        await redisClient.del(`session:${sessionId}`);
+        const storedToken = await redisClient.get(`session:${sessionId}`);
+        if (storedToken) {
+            const session = JSON.parse(storedToken);
+            await redisClient.sRem(`user_sessions:${session.userId}`, sessionId);
+            await redisClient.del(`session:${sessionId}`);
+        }
         return { message: "Logout successful" };
     } catch (error:any) {
         throw new Error(error.message || "Logout failed");
+    }
+}
+
+// logout from all devices
+const logoutAllDevices = async (userId: string) => {
+    try {
+        const sessionIds = await redisClient.sMembers(`user_sessions:${userId}`);
+        if (sessionIds.length > 0) {
+            const pipeline = redisClient.multi();
+            for (const sid of sessionIds) {
+                pipeline.del(`session:${sid}`);
+            }
+            pipeline.del(`user_sessions:${userId}`);
+            await pipeline.exec();
+        }
+        return { message: "Logged out from all devices successfully" };
+    } catch (error: any) {
+        throw new Error(error.message || "Logout from all devices failed");
     }
 }
 
@@ -191,4 +219,53 @@ const getUserProfile = async (userId: string) => {
 
 //logout user
 
-export { registerUser, verifyEmail, loginUser, refreshAccessToken, getUserProfile, logoutUser };
+const forgotPassword = async (email: string) => {
+    try {
+        const user = await User.findOne({ email });
+        if (!user) {
+            return { message: "If an account with that email exists, we sent a password reset OTP." };
+        }
+
+        const otp = generateOTP();
+        await redisClient.set(`forgotPasswordOtp:${email}`, otp, { EX: 600 }); // 10 mins
+
+        await addEmailJob({
+            to: email,
+            subject: "Password Reset OTP",
+            html: `<h1>Password Reset</h1><p>Your OTP to reset your password is:</p><h2>${otp}</h2><p>This code expires in 10 minutes.</p>`
+        });
+
+        return { message: "If an account with that email exists, we sent a password reset OTP." };
+    } catch (error: any) {
+        throw new Error(error.message || "Failed to process forgot password request");
+    }
+}
+
+const resetPassword = async (data: { email: string, otp: string, newPassword: string }) => {
+    try {
+        const { email, otp, newPassword } = data;
+        
+        const storedOtp = await redisClient.get(`forgotPasswordOtp:${email}`);
+        if (!storedOtp || storedOtp !== otp) {
+            throw new Error("Invalid or expired OTP");
+        }
+
+        const user = await User.findOne({ email });
+        if (!user) {
+            throw new Error("User not found");
+        }
+
+        const passwordHash = await bcrypt.hash(newPassword, 10);
+        await Account.findOneAndUpdate({ userId: user._id }, { passwordHash });
+
+        await redisClient.del(`forgotPasswordOtp:${email}`);
+
+        await logoutAllDevices(user._id.toString());
+
+        return { message: "Password has been reset successfully" };
+    } catch (error: any) {
+        throw new Error(error.message || "Failed to reset password");
+    }
+}
+
+export { registerUser, verifyEmail, loginUser, refreshAccessToken, getUserProfile, logoutUser, logoutAllDevices, forgotPassword, resetPassword };
